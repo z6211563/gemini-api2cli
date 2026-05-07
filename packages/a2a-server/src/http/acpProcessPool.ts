@@ -663,8 +663,30 @@ export class AcpWorker {
 
   /**
    * Cancel an ongoing prompt.
+   *
+   * Marks the most recent in-flight prompt record for this session
+   * as 'cancelled' immediately rather than waiting for the agent's
+   * acknowledgment. The actual ACP cancel request still races
+   * upstream, but the admin console's prompt-row status updates
+   * within one poll instead of stalling on "in_progress" until the
+   * CLI acks (which can take 30+ seconds when Google itself is slow
+   * to respond, e.g. on quota-exhausted credentials).
    */
   async cancelPrompt(sessionId: string): Promise<void> {
+    // Find the most recent record for this session that's still
+    // in_progress and flip it. There's only ever one such record
+    // because prompt() rejects on overlap, but iterate from newest
+    // to be safe — the ring buffer is small (≤20).
+    for (let i = this.recentPrompts.length - 1; i >= 0; i--) {
+      const r = this.recentPrompts[i];
+      if (r.acpSessionId === sessionId && r.status === 'in_progress') {
+        r.status = 'cancelled';
+        r.finishedAt = Date.now();
+        r.durationMs = r.finishedAt - r.startedAt;
+        if (!r.errorMessage) r.errorMessage = 'Cancelled by client';
+        break;
+      }
+    }
     if (this.connection && this._state === 'ready') {
       await this.connection.cancel({ sessionId });
     }

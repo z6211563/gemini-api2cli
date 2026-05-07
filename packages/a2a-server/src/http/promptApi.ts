@@ -530,9 +530,57 @@ function getPromptApiCurrentModelPayload(modelId: string) {
   };
 }
 
+/**
+ * One per-(credential × model) cooldown entry as exposed to the
+ * admin console. `model === '*'` means a credential-wide cooldown
+ * (auth failure, generic disablement); the UI renders that
+ * differently (a red "re-login needed" badge instead of a
+ * model-keyed countdown).
+ */
+interface CredentialCooldownPayload {
+  model: string;
+  expiresAt: number;
+  secondsRemaining: number;
+}
+
+/**
+ * Walk the in-memory cooldown map and pull out everything tied to
+ * one credential. Skips already-expired entries on the way out so
+ * the UI never shows a "0s remaining" zombie. Each cooldown key
+ * encodes its model after the unit-separator delimiter (see
+ * cooldownKey above).
+ */
+function extractCooldownsForCredential(
+  state: PromptApiState,
+  credentialId: string,
+): CredentialCooldownPayload[] {
+  const now = Date.now();
+  const out: CredentialCooldownPayload[] = [];
+  const prefix = credentialId + '\x1f';
+  for (const [k, exp] of state.credentialCooldowns) {
+    if (typeof exp !== 'number') continue;
+    if (exp <= now) continue;
+    if (!k.startsWith(prefix)) continue;
+    const model = k.slice(prefix.length);
+    out.push({
+      model,
+      expiresAt: exp,
+      secondsRemaining: Math.max(0, Math.ceil((exp - now) / 1000)),
+    });
+  }
+  // Sort credential-wide first (most severe), then by remaining time.
+  out.sort((a, b) => {
+    if (a.model === '*' && b.model !== '*') return -1;
+    if (b.model === '*' && a.model !== '*') return 1;
+    return b.secondsRemaining - a.secondsRemaining;
+  });
+  return out;
+}
+
 function getPromptApiCredentialPayload(
   credential: PromptApiCredentialRecord,
   currentCredentialId?: string,
+  cooldowns?: CredentialCooldownPayload[],
 ) {
   return {
     id: credential.id,
@@ -542,6 +590,9 @@ function getPromptApiCredentialPayload(
     updatedAt: credential.updatedAt,
     ...(credential.lastLoginAt ? { lastLoginAt: credential.lastLoginAt } : {}),
     isCurrent: credential.id === currentCredentialId,
+    // Empty array (not undefined) so the UI can rely on `.length`
+    // without an extra null check on every render.
+    cooldowns: cooldowns ?? [],
   };
 }
 
@@ -559,11 +610,19 @@ async function getPromptApiCredentialsPayload(state: PromptApiState) {
     await state.credentialStore.getCurrentCredentialId();
   const credentials = await state.credentialStore.listCredentials();
 
+  // Prune expired cooldowns before reading so the response is clean
+  // and the cooldown map doesn't grow unboundedly.
+  pruneCredentialCooldowns(state);
+
   return {
     currentCredentialId: currentCredentialId ?? null,
     sessionPolicy: 'per-request',
     credentials: credentials.map((credential) =>
-      getPromptApiCredentialPayload(credential, currentCredentialId),
+      getPromptApiCredentialPayload(
+        credential,
+        currentCredentialId,
+        extractCooldownsForCredential(state, credential.id),
+      ),
     ),
   };
 }
@@ -765,6 +824,7 @@ async function getPromptApiCredentialQuotaPayload(
   const credentialPayload = getPromptApiCredentialPayload(
     credential,
     currentCredentialId,
+    extractCooldownsForCredential(state, credential.id),
   );
   const credentialHomeDir = state.credentialStore.getCredentialHomeDir(
     credential.id,
@@ -2885,7 +2945,12 @@ export function createPromptApiRouter(
   //      "timed out" error to the operator instead of a CF 524.
   //      The prompt is cancelled so the underlying CLI process
   //      doesn't keep doing work on a dropped request.
-  const TEST_TIMEOUT_MS = 30_000;
+  // 15 s is comfortable for any healthy credential — typical Gemini
+  // round-trip is 1-3 s. Anything slower is a near-certain credential
+  // health issue (the CLI subprocess retries 429 errors internally,
+  // eating into our window), and a faster test → faster feedback for
+  // the operator. Still well under Cloudflare's 100 s edge timeout.
+  const TEST_TIMEOUT_MS = 15_000;
   router.post('/v1/credentials/:credentialId/test', async (req, res) => {
     const credentialId = req.params['credentialId'];
     if (typeof credentialId !== 'string' || !credentialId) {
@@ -3233,7 +3298,11 @@ export function createPromptApiRouter(
       const credential = await state.credentialStore.getCurrentCredential();
       return res.status(200).json({
         currentCredential: credential
-          ? getPromptApiCredentialPayload(credential, currentCredentialId)
+          ? getPromptApiCredentialPayload(
+              credential,
+              currentCredentialId,
+              extractCooldownsForCredential(state, credential.id),
+            )
           : null,
         sessionPolicy: 'per-request',
       });

@@ -120,6 +120,12 @@ a{color:var(--accent);text-decoration:none}
 .cred-id{font-family:var(--mono);font-size:11px;color:var(--text3);margin-top:4px;word-break:break-all}
 .cred-actions{display:flex;gap:6px;margin-top:12px;flex-wrap:wrap}
 
+/* ── Credential Cooldown Chips ── */
+.cred-cooldowns{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.cred-cooldown{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:6px;font-size:11.5px;font-weight:600;font-family:var(--mono);line-height:1.4;cursor:help}
+.cred-cooldown-model{background:var(--amber-bg);color:var(--amber);border:1px solid rgba(245,158,11,.2)}
+.cred-cooldown-auth{background:var(--red-bg);color:var(--red);border:1px solid rgba(239,68,68,.25);font-weight:700}
+
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600}
 .badge-active{background:var(--green-bg);color:var(--green)}
 .badge-stored{background:rgba(155,163,184,.1);color:var(--text3)}
@@ -659,6 +665,9 @@ const I = {
     completingLogin: 'Completing...',
     testCredBtn: 'Test',
     testCredTip: 'Send a real request to verify this credential works.',
+    credCooldownAuth: 'Auth failed — re-login needed',
+    credCooldownAuthHint: 'This credential returned 400/401/403. The OAuth token is likely expired or revoked. Delete and re-add this credential, or wait until the cooldown ends to retry.',
+    credCooldownQuotaHint: 'Quota cooldown until the timestamp Google reported. This model on this credential is paused; other models on the same credential keep working.',
     reqSettings: 'Request Settings',
     reqSettingsDesc: 'Configure credential rotation and error retry behavior.',
     rotationLabel: 'Credential Rotation',
@@ -825,6 +834,9 @@ const I = {
     completingLogin: '完成中...',
     testCredBtn: '测试',
     testCredTip: '发送真实请求验证此凭据是否可用。',
+    credCooldownAuth: '认证失败，需要重新登录',
+    credCooldownAuthHint: '此凭据返回了 400/401/403，OAuth token 已过期或被吊销。请删除并重新添加此凭据，或等到冷却期结束再重试。',
+    credCooldownQuotaHint: '配额冷却中，将在 Google 提供的重置时间后自动恢复。此凭据的这个模型暂停可用，同凭据的其他模型仍然正常。',
     reqSettings: '请求设置',
     reqSettingsDesc: '配置凭据轮询和错误重试行为。',
     rotationLabel: '凭据轮询',
@@ -1213,6 +1225,56 @@ function renderStatus(health, models, creds) {
 }
 
 /* ── Render: Credentials ── */
+// Format a duration in seconds as a compact "Xh Ym" / "Xm Ys" /
+// "Xs" string for cooldown countdowns. Tracks gcli2api's display
+// idiom — operators glance at the card and immediately see when the
+// quota window flips.
+function fmtCooldownRemaining(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return m + 'm' + (remS > 0 ? remS + 's' : '');
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  if (h < 24) return h + 'h' + (remM > 0 ? remM + 'm' : '');
+  const d = Math.floor(h / 24);
+  const remH = h % 24;
+  return d + 'd' + (remH > 0 ? remH + 'h' : '');
+}
+
+// Render the per-(credential × model) cooldown chips inside a cred
+// card. Two visual modes:
+//   - model = '*'  → big red "auth failed, re-login" badge
+//   - per-model    → orange "⏰ <model>: 3h12m" countdown chip
+// We compute "now" client-side so a stale list (e.g. tab in
+// background) doesn't show artificially-large remaining times.
+function renderCredCooldowns(cooldowns) {
+  if (!Array.isArray(cooldowns) || cooldowns.length === 0) return '';
+  const now = Date.now();
+  const items = [];
+  for (const c of cooldowns) {
+    const remainingMs = c.expiresAt ? c.expiresAt - now : c.secondsRemaining * 1000;
+    if (remainingMs <= 0) continue; // already expired client-side
+    const remainingSec = Math.ceil(remainingMs / 1000);
+    if (c.model === '*') {
+      items.push(
+        '<span class="cred-cooldown cred-cooldown-auth" title="'+esc(t('credCooldownAuthHint'))+'">' +
+        '⚠️ ' + esc(t('credCooldownAuth')) + ' — ' + esc(fmtCooldownRemaining(remainingSec)) +
+        '</span>'
+      );
+    } else {
+      items.push(
+        '<span class="cred-cooldown cred-cooldown-model" title="' + esc(t('credCooldownQuotaHint')) + '">' +
+        '⏰ ' + esc(c.model) + ': ' + esc(fmtCooldownRemaining(remainingSec)) +
+        '</span>'
+      );
+    }
+  }
+  if (items.length === 0) return '';
+  return '<div class="cred-cooldowns">' + items.join('') + '</div>';
+}
+
 function renderCreds(payload) {
   S.credentials = payload.credentials || [];
   if (!S.credentials.length) {
@@ -1230,6 +1292,7 @@ function renderCreds(payload) {
         '<div class="cred-id">'+esc(c.id)+'</div></div>'+
         badge+
       '</div>'+
+      renderCredCooldowns(c.cooldowns)+
       '<div class="cred-actions">'+
         '<button class="btn btn-ghost btn-sm" data-a="switch" data-id="'+esc(c.id)+'">'+esc(t('setActive'))+'</button>'+
         '<button class="btn btn-outline btn-sm" data-a="test" data-id="'+esc(c.id)+'" title="'+esc(t('testCredTip'))+'">'+esc(t('testCredBtn'))+'</button>'+
