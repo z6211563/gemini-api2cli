@@ -535,6 +535,14 @@ export class AcpWorker {
         errorMessage?: string;
       },
     ): void => {
+      // `cancelled` is sticky — once the operator (or test
+      // endpoint) cancels a prompt, the record reflects what the
+      // user actually saw at the time, not the eventual outcome
+      // of the still-in-flight CLI request. The actual final
+      // outcome (success/error/quota) is captured by the caller's
+      // post-mortem handler if it cares — see the test endpoint
+      // in promptApi.ts.
+      if (promptRecord.status === 'cancelled') return;
       promptRecord.status = status;
       promptRecord.finishedAt = Date.now();
       promptRecord.durationMs =

@@ -2964,10 +2964,41 @@ export function createPromptApiRouter(
         .json({ error: `Credential not found: ${credentialId}` });
     }
 
+    // Short-circuit: if we already know this credential is in
+    // cooldown (auth failure or quota exhausted on a previous real
+    // request), skip the API round-trip and return the recorded
+    // cooldown info immediately. This avoids wasting 15 s of the
+    // operator's time waiting on a CLI subprocess that's just going
+    // to retry an already-known-bad credential, and gives them an
+    // actionable status ("cooldown until X") instead of a generic
+    // "unhealthy".
+    const existingCooldowns = extractCooldownsForCredential(state, credentialId);
+    if (existingCooldowns.length > 0) {
+      const wide = existingCooldowns.find((c) => c.model === '*');
+      const lead = wide ?? existingCooldowns[0];
+      const reason =
+        lead.model === '*'
+          ? 'Credential in auth-failure cooldown — re-login required'
+          : `Quota cooldown active for model "${lead.model}" — recovers in ${Math.ceil(lead.secondsRemaining / 60)} min`;
+      return res.status(200).json({
+        ok: false,
+        credentialId,
+        durationMs: 0,
+        error: reason,
+        cooldowns: existingCooldowns,
+        skipped: true,
+      });
+    }
+
+    const requestModel = state.currentModel;
     const homeDir = state.credentialStore.getCredentialHomeDir(credentialId);
     const startTime = Date.now();
     let worker: AcpWorker | undefined;
     let sessionId: string | undefined;
+    // Holds a reference to the underlying prompt() promise so we can
+    // continue awaiting it in the background after a user-facing
+    // timeout — see "post-mortem" comment below.
+    let promptPromise: Promise<string> | undefined;
 
     try {
       worker = await state.acpPool.getOrCreate(credentialId, homeDir, {
@@ -2987,7 +3018,7 @@ export function createPromptApiRouter(
       // TypeScript's narrowing doesn't lose them across the await.
       const w = worker;
       const sid = sessionId;
-      const promptPromise = w
+      promptPromise = w
         .prompt(
           sid,
           [{ type: 'text', text: 'Reply with "ok".' }],
@@ -3039,6 +3070,53 @@ export function createPromptApiRouter(
           /* best-effort cleanup */
         }
       }
+
+      // ── Post-mortem: capture the real failure reason ──
+      // The CLI subprocess retries 429s internally for ~30s, longer
+      // than our 15s test timeout. When we time out, we don't yet
+      // know whether the credential is genuinely broken or just
+      // momentarily slow. So we let the underlying prompt promise
+      // continue running in the background and update cooldown /
+      // log whatever it eventually returns:
+      //   - rejects with 429 / RESOURCE_EXHAUSTED → record exact
+      //     cooldown via applyCredentialCooldown so the next
+      //     refresh of /v1/credentials shows the precise countdown
+      //     chip on the card.
+      //   - rejects with auth error → credential-wide cooldown,
+      //     so the admin console flags it for re-login.
+      //   - resolves successfully → log a warning that we
+      //     erroneously timed out a healthy credential (which is
+      //     actually useful diagnostic info — it means CLI's
+      //     internal retry succeeded and the credential is fine
+      //     after all).
+      // Promise is detached (void) — the response has already been
+      // sent so we don't await it.
+      if (promptPromise) {
+        const credIdSnapshot = credentialId;
+        const modelSnapshot = requestModel;
+        void promptPromise.then(
+          (reply) => {
+            logger.info(
+              `[ACP] Test post-mortem: credential ${credIdSnapshot} eventually succeeded (CLI internal retry recovered after our ${TEST_TIMEOUT_MS / 1000}s timeout). Reply length=${reply.length}. Credential is healthy; cooldown not applied.`,
+            );
+          },
+          (postErr: unknown) => {
+            const postMsg = extractErrorMessage(postErr);
+            logger.info(
+              `[ACP] Test post-mortem: credential ${credIdSnapshot} failed with: ${postMsg.slice(0, 300)}`,
+            );
+            if (isCredentialFailoverError(postErr)) {
+              applyCredentialCooldown(
+                state,
+                credIdSnapshot,
+                modelSnapshot,
+                postErr,
+              );
+            }
+          },
+        );
+      }
+
       // Return 200 with ok:false so the admin console frontend
       // surfaces the error as a credential-level fault, not a
       // transport error. Transport errors should be reserved for
@@ -3048,6 +3126,11 @@ export function createPromptApiRouter(
         credentialId,
         durationMs,
         error: err instanceof Error ? err.message : String(err),
+        // Hint that we're going to record cooldown info shortly
+        // (empty if we already had recorded ones — those would have
+        // hit the short-circuit above). Lets the frontend prompt
+        // the user to refresh in ~30 s.
+        postMortemPending: true,
       });
     } finally {
       if (worker && sessionId) {
