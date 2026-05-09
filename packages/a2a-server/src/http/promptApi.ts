@@ -2949,37 +2949,44 @@ export function createPromptApiRouter(
     });
   });
 
-  // Health-check a single credential by issuing a *real* (but
-  // cheap) generateContent request directly against Google's
-  // cloudcode-pa.googleapis.com/v1internal endpoint — no CLI
-  // subprocess, no ACP, no retry loops.
+  // Health-check a single credential. Two probe modes are exposed:
   //
-  // We probe with `gemini-2.5-flash` and `maxOutputTokens: 1`, the
-  // same approach gcli2api uses. This is more thorough than the
-  // earlier loadCodeAssist-based implementation:
+  //   1. 'auth'    — POST /v1/credentials/:id/test
+  //                  Lightweight: only runs setupUser (loadCodeAssist
+  //                  + onboardUser). Verifies the OAuth token can
+  //                  authenticate and the account has a valid
+  //                  Code Assist tier + projectId. Cheap, no quota
+  //                  cost. Cannot detect per-model quota exhaustion
+  //                  — loadCodeAssist returns 200 even when a
+  //                  specific model is rate-limited.
   //
-  //   - loadCodeAssist only checks account auth + tier; it
-  //     returns 200 even when a *specific model's* quota is
-  //     exhausted, giving false positives.
-  //   - generateContent exercises the actual chat path, so
-  //     per-(account × model × time-window) quota state surfaces
-  //     as a real 429 with quotaResetTimeStamp.
-  //   - Cost: ~1 token per test (negligible).
+  //   2. 'message' — POST /v1/credentials/:id/test-message
+  //                  Full probe: setupUser + a real generateContent
+  //                  call against `gemini-2.5-flash` with
+  //                  maxOutputTokens=1 (same fixture gcli2api
+  //                  uses). Exercises the actual chat path, so
+  //                  per-(account × model × window) quota state
+  //                  surfaces as a real 429 with
+  //                  quotaResetTimeStamp. Cost: ~1 token.
   //
-  // setupUser is reused to fetch the credential's projectId
-  // (loadCodeAssist + onboardUser flow) — same code the quota
-  // endpoint already uses, so we don't duplicate that machinery.
+  // Cooldowns set by either mode go through the same
+  // applyCredentialCooldown path the production traffic uses, so
+  // a 429 found by the message probe immediately gates routing.
   const TEST_TIMEOUT_MS = 15_000;
   const CODE_ASSIST_BASE_URL = 'https://cloudcode-pa.googleapis.com';
   const TEST_API_PATH = '/v1internal:generateContent';
   const TEST_MODEL = 'gemini-2.5-flash';
-  router.post('/v1/credentials/:credentialId/test', async (req, res) => {
+  type ProbeMode = 'auth' | 'message';
+  const handleCredentialProbe = async (
+    req: Request,
+    res: Response,
+    mode: ProbeMode,
+  ) => {
     const credentialId = req.params['credentialId'];
     if (typeof credentialId !== 'string' || !credentialId) {
       return res.status(400).json({ error: 'Invalid credential ID' });
     }
-    const credential =
-      await state.credentialStore.getCredential(credentialId);
+    const credential = await state.credentialStore.getCredential(credentialId);
     if (!credential) {
       return res
         .status(404)
@@ -2990,7 +2997,10 @@ export function createPromptApiRouter(
     // cooldown (auth failure or quota exhausted on a previous real
     // request), skip the API round-trip and return the recorded
     // cooldown info immediately.
-    const existingCooldowns = extractCooldownsForCredential(state, credentialId);
+    const existingCooldowns = extractCooldownsForCredential(
+      state,
+      credentialId,
+    );
     if (existingCooldowns.length > 0) {
       const wide = existingCooldowns.find((c) => c.model === '*');
       const lead = wide ?? existingCooldowns[0];
@@ -3093,6 +3103,22 @@ export function createPromptApiRouter(
         });
       }
 
+      // 'auth' mode stops here — setupUser succeeded, OAuth is
+      // valid, projectId resolved. That's all this mode promises:
+      // "the credential is reachable". It deliberately does NOT
+      // probe per-model quota (so it stays cheap and never burns
+      // tokens), which means a credential with an exhausted model
+      // can still report OK in this mode. Use 'message' mode to
+      // catch that case.
+      if (mode === 'auth') {
+        return res.status(200).json({
+          ok: true,
+          credentialId,
+          durationMs: Date.now() - startTime,
+          reply: `OK — auth & projectId resolved (${projectId})`,
+        });
+      }
+
       // Real probe: send a minimal "hi" prompt with maxOutputTokens=1
       // against gemini-2.5-flash. This is the same fixture gcli2api
       // uses — cheap (~1 token) but exercises the *real* chat path
@@ -3126,9 +3152,8 @@ export function createPromptApiRouter(
         // credential for an upstream blip.
         const errMsg = extractErrorMessage(httpErr);
         const durationMs = Date.now() - startTime;
-        const looksLikeTimeout = /\b(timeout|aborted|ECONNRESET|ETIMEDOUT)\b/i.test(
-          errMsg,
-        );
+        const looksLikeTimeout =
+          /\b(timeout|aborted|ECONNRESET|ETIMEDOUT)\b/i.test(errMsg);
         return res.status(200).json({
           ok: false,
           credentialId,
@@ -3140,7 +3165,10 @@ export function createPromptApiRouter(
       }
 
       const durationMs = Date.now() - startTime;
-      const bodyText = typeof httpBody === 'string' ? httpBody : JSON.stringify(httpBody ?? {});
+      const bodyText =
+        typeof httpBody === 'string'
+          ? httpBody
+          : JSON.stringify(httpBody ?? {});
 
       // ── 200: healthy ─────────────────────────────────────────────
       // generateContent returned, model produced ≥ 0 tokens (we
@@ -3259,7 +3287,20 @@ export function createPromptApiRouter(
         error: errMsg,
       });
     }
-  });
+  };
+
+  // Auth-only check (loadCodeAssist + onboardUser via setupUser).
+  // Renders as the "凭证可用 / Available?" button on the admin
+  // console — fast, no quota cost.
+  router.post('/v1/credentials/:credentialId/test', (req, res) =>
+    handleCredentialProbe(req, res, 'auth'),
+  );
+  // Real chat probe (gemini-2.5-flash, maxOutputTokens=1). Renders
+  // as the "消息测试 / Message Test" button — exercises actual
+  // request path so per-model quota exhaustion shows as a real 429.
+  router.post('/v1/credentials/:credentialId/test-message', (req, res) =>
+    handleCredentialProbe(req, res, 'message'),
+  );
 
   // --- Logs panel endpoints ----------------------------------------------
   // Historical snapshot (filters applied server-side so the client only

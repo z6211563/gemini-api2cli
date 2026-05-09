@@ -661,10 +661,13 @@ const I = {
     tokenEmpty: 'Please enter a token.',
     testSuccess: 'OK — Request succeeded.',
     testing: 'Testing...',
+    msgTesting: 'Sending message...',
     startingLogin: 'Starting...',
     completingLogin: 'Completing...',
-    testCredBtn: 'Test',
-    testCredTip: 'Send a real request to verify this credential works.',
+    testCredBtn: 'Available?',
+    testCredTip: 'Auth check — verify OAuth token & projectId are valid (cheap, no quota cost).',
+    msgTestBtn: 'Message Test',
+    msgTestTip: 'Send a real "hi" message via gemini-2.5-flash to verify the credential can actually generate (catches per-model quota exhaustion).',
     credCooldownAuth: 'Auth failed — re-login needed',
     credCooldownAuthHint: 'This credential returned 400/401/403. The OAuth token is likely expired or revoked. Delete and re-add this credential, or wait until the cooldown ends to retry.',
     credCooldownQuotaHint: 'Quota cooldown until the timestamp Google reported. This model on this credential is paused; other models on the same credential keep working.',
@@ -830,10 +833,13 @@ const I = {
     tokenEmpty: '请输入密钥。',
     testSuccess: '正常 — 请求成功。',
     testing: '测试中...',
+    msgTesting: '发送消息中...',
     startingLogin: '发起中...',
     completingLogin: '完成中...',
-    testCredBtn: '测试',
-    testCredTip: '发送真实请求验证此凭据是否可用。',
+    testCredBtn: '凭证可用',
+    testCredTip: '认证检查 — 验证 OAuth Token 和 projectId 是否有效（轻量级，不消耗配额）。',
+    msgTestBtn: '消息测试',
+    msgTestTip: '通过 gemini-2.5-flash 发送一条真实的 "hi" 消息，验证凭证能否真正生成内容（可发现单模型配额耗尽问题）。',
     credCooldownAuth: '认证失败，需要重新登录',
     credCooldownAuthHint: '此凭据返回了 400/401/403，OAuth token 已过期或被吊销。请删除并重新添加此凭据，或等到冷却期结束再重试。',
     credCooldownQuotaHint: '配额冷却中，将在 Google 提供的重置时间后自动恢复。此凭据的这个模型暂停可用，同凭据的其他模型仍然正常。',
@@ -1296,6 +1302,7 @@ function renderCreds(payload) {
       '<div class="cred-actions">'+
         '<button class="btn btn-ghost btn-sm" data-a="switch" data-id="'+esc(c.id)+'">'+esc(t('setActive'))+'</button>'+
         '<button class="btn btn-outline btn-sm" data-a="test" data-id="'+esc(c.id)+'" title="'+esc(t('testCredTip'))+'">'+esc(t('testCredBtn'))+'</button>'+
+        '<button class="btn btn-outline btn-sm" data-a="test-message" data-id="'+esc(c.id)+'" title="'+esc(t('msgTestTip'))+'">'+esc(t('msgTestBtn'))+'</button>'+
         '<button class="btn btn-outline btn-sm" data-a="quota" data-id="'+esc(c.id)+'">'+esc(t('viewQuota'))+'</button>'+
         '<button class="btn btn-danger btn-sm" data-a="delete" data-id="'+esc(c.id)+'">'+esc(t('delete'))+'</button>'+
       '</div>'+
@@ -1591,34 +1598,50 @@ $('cred-list').onclick = e => {
       $('quota-detail').textContent = JSON.stringify(p, null, 2);
     }).catch(showErr);
   } else if (action === 'test') {
-    testCredential(id);
+    testCredential(id, 'auth');
+  } else if (action === 'test-message') {
+    testCredential(id, 'message');
   } else if (action === 'delete') {
     if (!confirm(t('confirmDelete')+id)) return;
     api('/v1/credentials/'+id,{method:'DELETE'}).then(()=>refreshAll()).catch(showErr);
   }
 };
 
-/* ── Test a credential ── */
-async function testCredential(credentialId) {
-  const btn = document.querySelector('button[data-a="test"][data-id="'+credentialId+'"]');
+/* ── Test a credential ──
+ * mode='auth'    → POST /test         (lightweight setupUser check)
+ * mode='message' → POST /test-message (real generateContent probe)
+ * Both write to the same per-credential result line; only one
+ * probe should be in-flight at a time per credential, so the
+ * sibling button is disabled while the other is running.
+ */
+async function testCredential(credentialId, mode) {
+  const isMsg = mode === 'message';
+  const btnSelector = isMsg ? 'test-message' : 'test';
+  const otherSelector = isMsg ? 'test' : 'test-message';
+  const path = isMsg ? '/test-message' : '/test';
+  const labelKey = isMsg ? 'msgTestBtn' : 'testCredBtn';
+  const inflightKey = isMsg ? 'msgTesting' : 'testing';
+  const btn = document.querySelector('button[data-a="'+btnSelector+'"][data-id="'+credentialId+'"]');
+  const otherBtn = document.querySelector('button[data-a="'+otherSelector+'"][data-id="'+credentialId+'"]');
   const resultEl = $('cred-test-'+credentialId);
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px"></span>' + t('testing'); }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px"></span>' + t(inflightKey); }
+  if (otherBtn) { otherBtn.disabled = true; }
   if (resultEl) { resultEl.className = 'cred-test-result'; resultEl.textContent = ''; }
   try {
-    // Use the dedicated per-credential health-check endpoint. Unlike
-    // /v1/openai/chat/completions, this:
-    //   - Tests THIS credential only (no silent failover to other
+    // Use the dedicated per-credential health-check endpoints. Unlike
+    // /v1/openai/chat/completions, these:
+    //   - Test THIS credential only (no silent failover to other
     //     credentials, which would make a broken credential appear
     //     to "work").
-    //   - Doesn't retry, so a slow-failing credential won't stack
+    //   - Don't retry, so a slow-failing credential won't stack
     //     up four 25 s attempts and trip Cloudflare's 100 s timeout
     //     (the "Cloudflare returned HTTP 524" bug).
-    //   - Has a 30 s server-side cap; the response always comes
+    //   - Have a server-side cap (15 s); the response always comes
     //     back well inside any proxy timeout.
     // The response always has shape { ok, durationMs, reply | error }
     // and HTTP status is 200 for credential faults — only true
     // transport problems surface as exceptions here.
-    const r = await api('/v1/credentials/' + encodeURIComponent(credentialId) + '/test', {
+    const r = await api('/v1/credentials/' + encodeURIComponent(credentialId) + path, {
       method: 'POST',
     });
     if (resultEl) {
@@ -1640,7 +1663,8 @@ async function testCredential(credentialId) {
       resultEl.textContent = msg;
     }
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = t('testCredBtn'); }
+    if (btn) { btn.disabled = false; btn.textContent = t(labelKey); }
+    if (otherBtn) { otherBtn.disabled = false; }
   }
 }
 
